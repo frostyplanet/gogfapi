@@ -29,11 +29,23 @@ package gfapi
 // #include "api/glfs.h"
 // #include <stdlib.h>
 // #include <sys/stat.h>
+// #include <string.h>
+//
+// void async_cb_cgo(glfs_fd_t *, ssize_t, void *);
+//
 import "C"
 import (
+	"errors"
+	"sync"
 	"syscall"
 	"unsafe"
 )
+
+type cb_param struct {
+	wg sync.WaitGroup
+	ret int
+	errno int
+}
 
 // Fd is the glusterfs fd type
 type Fd struct {
@@ -98,9 +110,33 @@ func (fd *Fd) Pwrite(b []byte, off int64) (int, error) {
 //
 // Returns number of bytes read on success and error on failure
 func (fd *Fd) Read(b []byte) (int, error) {
-	n, err := C.glfs_read(fd.fd, unsafe.Pointer(&b[0]), C.size_t(len(b)), 0)
 
-	return int(n), err
+	param := new(cb_param)
+	param.wg.Add(1)
+
+	n, err := C.glfs_read_async(fd.fd, unsafe.Pointer(&b[0]),
+		C.size_t(len(b)), 0,
+		C.glfs_io_cbk(unsafe.Pointer(C.async_cb_cgo)), unsafe.Pointer(param),
+	)
+	if n != 0 {
+		param.wg.Done()
+		return -1, err
+	}
+	param.wg.Wait()
+	if param.ret < 0 {
+		err = errors.New(C.GoString(C.strerror(C.int(param.errno))))
+	} else {
+		err = nil
+	}
+	return param.ret, err
+}
+
+//export asyncCb
+func asyncCb(fd *C.glfs_fd_t, p unsafe.Pointer, ret C.ssize_t, err int) {
+	var param * cb_param = (*cb_param)(p)
+	param.ret = int(ret)
+	param.errno = err
+	param.wg.Done()
 }
 
 // Write writes len(b) bytes from b into the Fd
@@ -108,14 +144,27 @@ func (fd *Fd) Read(b []byte) (int, error) {
 // Returns number of bytes written on success and error on failure
 func (fd *Fd) Write(b []byte) (int, error) {
 
-	n, err := C.glfs_write(fd.fd, unsafe.Pointer(&b[0]), C.size_t(len(b)), 0)
-	if n == C.ssize_t(len(b)) {
+	param := new(cb_param)
+	param.wg.Add(1)
+
+	n, err := C.glfs_write_async(fd.fd, unsafe.Pointer(&b[0]),
+		C.size_t(len(b)), 0,
+		C.glfs_io_cbk(unsafe.Pointer(C.async_cb_cgo)), unsafe.Pointer(param),
+	)
+	//if C.ssize_t(n) != C.ssize_t(len(b)) && err != nil {
+	if n != 0 {
 		// FIXME: errno is set to EINVAL even though write is successful. This
 		// is probably a bug. Remove this workaround when that gets fixed.
+		param.wg.Done()
+		return -1, err
+	}
+	param.wg.Wait()
+	if param.ret < 0 {
+		err = errors.New(C.GoString(C.strerror(C.int(param.errno))))
+	} else {
 		err = nil
 	}
-	return int(n), err
-
+	return param.ret, err
 }
 
 func (fd *Fd) lseek(offset int64, whence int) (int64, error) {
